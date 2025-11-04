@@ -1,0 +1,9 @@
+pandas
+numpy
+requests
+beautifulsoup4
+lxml
+tqdm
+scikit-learn
+joblib
+# lightgbm (optional)
