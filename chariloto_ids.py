@@ -79,6 +79,18 @@ def _build_race_ids_for_bank(date: str, bank: str, max_races: int = 12) -> List[
     return [f"{date_raw}CL{bank}{race:02d}" for race in range(1, max_races + 1)]
 
 
+def _all_bank_codes() -> List[str]:
+    return [f"{bank:02d}" for bank in range(1, 100)]
+
+
+def _fallback_bank_race_ids(date: str, max_races: int = 12) -> List[str]:
+    LOGGER.info("Falling back to exhaustive bank enumeration for %s", date)
+    race_ids: List[str] = []
+    for bank in _all_bank_codes():
+        race_ids.extend(_build_race_ids_for_bank(date, bank, max_races=max_races))
+    return race_ids
+
+
 def fetch_race_ids_for_date(
     date: str,
     timeout: float = 10.0,
@@ -107,7 +119,8 @@ def fetch_race_ids_for_date(
         break
 
     if not race_ids:
-        LOGGER.warning("Unable to discover race IDs for %s", normalized_date)
+        LOGGER.warning("Unable to discover race IDs for %s; using fallback", normalized_date)
+        race_ids = _fallback_bank_race_ids(normalized_date)
     return race_ids
 
 

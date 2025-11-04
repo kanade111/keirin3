@@ -112,6 +112,8 @@ class Model:
     def predict_proba(self, cards_df: pd.DataFrame) -> np.ndarray:
         if cards_df.empty:
             return np.array([])
+        cards_df = cards_df.reset_index(drop=True)
+        race_ids = cards_df.get("race_id") if "race_id" in cards_df.columns else None
         if self._pipeline is None or not self.feature_columns:
             LOGGER.info("Using fallback probability based on %s", self.fallback_key)
             return self._fallback_probability(cards_df)
@@ -122,7 +124,7 @@ class Model:
         except Exception as exc:  # pragma: no cover - safety net
             LOGGER.error("Model prediction failed: %s", exc)
             return self._fallback_probability(cards_df)
-        return probabilities
+        return self._normalize_by_race(probabilities, race_ids)
 
     # ------------------------------------------------------------------
     def _prepare_features(self, cards_df: pd.DataFrame) -> pd.DataFrame:
@@ -136,7 +138,7 @@ class Model:
         return df
 
     def _fallback_probability(self, cards_df: pd.DataFrame) -> np.ndarray:
-        df = cards_df.copy()
+        df = cards_df.copy().reset_index(drop=True)
         key = self.fallback_key
         if key not in df.columns:
             if "score" in df.columns:
@@ -153,17 +155,32 @@ class Model:
         df["_weight"] = values
         if "race_id" not in df.columns:
             df["race_id"] = ""
+        weights = df["_weight"].to_numpy(dtype=float)
+        return self._normalize_by_race(weights, df["race_id"])
 
-        weights: List[float] = []
-        for _, group in df.groupby("race_id", dropna=False):
-            group_weights = group["_weight"].astype(float)
+    def _normalize_by_race(self, weights: np.ndarray, race_ids: Optional[pd.Series]) -> np.ndarray:
+        if weights.size == 0:
+            return weights
+        normalized = np.zeros_like(weights, dtype=float)
+        if race_ids is None:
+            total = weights.sum()
+            if total <= 0:
+                return np.full_like(weights, 1.0 / len(weights), dtype=float)
+            return weights / total
+
+        race_series = pd.Series(race_ids).fillna("").astype(str)
+        position_lookup = {idx: pos for pos, idx in enumerate(race_series.index)}
+        for _, group in race_series.groupby(race_series, sort=False):
+            indices = [position_lookup[idx] for idx in group.index]
+            group_weights = weights[indices]
             total = group_weights.sum()
             if total <= 0:
-                normalized = np.full(len(group_weights), 1.0 / len(group_weights))
+                normalized_values = np.full(len(indices), 1.0 / len(indices), dtype=float)
             else:
-                normalized = group_weights / total
-            weights.extend(normalized.tolist())
-        return np.array(weights)
+                normalized_values = group_weights / total
+            for pos, value in zip(indices, normalized_values):
+                normalized[pos] = float(value)
+        return normalized
 
 
 __all__ = ["Model"]
