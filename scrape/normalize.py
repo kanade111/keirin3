@@ -1,18 +1,30 @@
-"""Utilities for converting scraped data into training-ready tables."""
+"""Normalization utilities for preparing training datasets."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from typing import Iterable, List
+
 import pandas as pd
 
-from utils import get_logger, save_csv, safe_to_numeric
+LOGGER = logging.getLogger(__name__)
 
-TRAINING_COLUMNS = [
+REQUIRED_COLUMNS = [
+    "race_id",
+    "date",
+    "race_no",
+    "lane_no",
+    "rider_name",
+    "score",
+    "bank_code",
+    "source",
+]
+
+ALL_COLUMNS = [
     "race_id",
     "date",
     "race_no",
     "stadium",
-    "track",
-    "title",
     "race_name",
     "grade",
     "class",
@@ -49,101 +61,60 @@ TRAINING_COLUMNS = [
     "term",
 ]
 
-KIMARITE_COLUMNS = {
-    "kimarite_nige": ("逃げ", "ニゲ", "Nige"),
-    "kimarite_makuri": ("捲り", "マクリ", "Makuri"),
-    "kimarite_sashi": ("差し", "差", "Sashi"),
-    "kimarite_mark": ("マーク", "Mark"),
-}
+
+def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    for column in columns:
+        if column not in df.columns:
+            df[column] = "" if column not in {"score", "age", "win_rate"} else pd.NA
+    return df
+
+
+def _normalize_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    numeric_columns = ["score", "age", "win_rate", "finish_pos", "line_pos", "field_size"]
+    for column in numeric_columns:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["lane_no"] = df["lane_no"].astype(str)
+    return df
 
 
 def to_training_csv(
-    out_path: Path,
+    out_path: str,
     info_df: pd.DataFrame,
     entry_df: pd.DataFrame,
     payout_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Join the scraped tables into the canonical training CSV."""
-
-    logger = get_logger(__name__)
+) -> None:
+    """Normalize DataFrames into the canonical races.csv format."""
 
     if entry_df.empty:
-        logger.warning("Entry dataframe is empty; nothing to normalise")
-        empty_df = pd.DataFrame(columns=TRAINING_COLUMNS)
-        save_csv(empty_df, Path(out_path))
-        return empty_df
+        LOGGER.warning("Entry dataframe is empty; output will still be generated with headers")
+        normalized = pd.DataFrame(columns=ALL_COLUMNS)
+    else:
+        entry_df = _ensure_columns(entry_df, REQUIRED_COLUMNS)
+        entry_df = _ensure_columns(entry_df, ALL_COLUMNS)
+        entry_df = _normalize_types(entry_df)
 
-    merged = entry_df.copy()
+        if not info_df.empty:
+            info_subset = info_df[["race_id", "race_name", "stadium"]].drop_duplicates()
+            entry_df = entry_df.merge(info_subset, on="race_id", how="left", suffixes=("", "_info"))
+            if "race_name_info" in entry_df.columns and "race_name" in entry_df.columns:
+                entry_df["race_name"] = entry_df["race_name"].fillna(entry_df["race_name_info"])
+            if "stadium_info" in entry_df.columns and "stadium" in entry_df.columns:
+                entry_df["stadium"] = entry_df["stadium"].fillna(entry_df["stadium_info"])
+            entry_df = entry_df.drop(columns=[col for col in entry_df.columns if col.endswith("_info")])
 
-    # Merge race-level metadata
-    info_columns = [
-        "race_id",
-        "stadium",
-        "track",
-        "race_name",
-        "grade",
-        "field_size",
-        "line_count",
-        "line_pattern",
-        "start_time",
-        "weather",
-        "wind",
-        "bank_code",
-        "term",
-    ]
-    if not info_df.empty:
-        info_subset = info_df.copy()
-        missing_cols = [col for col in info_columns if col not in info_subset.columns]
-        for col in missing_cols:
-            info_subset[col] = None
-        merged = merged.merge(info_subset[info_columns], on="race_id", how="left")
+        if not payout_df.empty and "finish_pos" not in entry_df.columns:
+            LOGGER.info("finish_pos not found in entries; attempting to merge from payouts")
+            payout_subset = payout_df[["race_id"]].drop_duplicates()
+            entry_df = entry_df.merge(payout_subset, on="race_id", how="left")
 
-    # Derive title/kaizai_no placeholders
-    merged["title"] = merged.get("term")
-    merged["kaizai_no"] = None
+        normalized = entry_df[ALL_COLUMNS]
 
-    # Normalise kimarite columns if they exist in entry_df (from results).
-    for target, candidates in KIMARITE_COLUMNS.items():
-        if target not in merged.columns:
-            for candidate in candidates:
-                if candidate in merged.columns:
-                    merged[target] = safe_to_numeric(merged[candidate])
-                    break
-            else:
-                merged[target] = None
-        else:
-            merged[target] = safe_to_numeric(merged[target])
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized.to_csv(path, index=False, encoding="utf-8-sig")
+    LOGGER.info("Training dataset written to %s", path)
 
-    numeric_columns = [
-        "lane_no",
-        "age",
-        "score",
-        "backs",
-        "homes",
-        "starts",
-        "win_rate",
-        "quinella_rate",
-        "top3_rate",
-        "finish_pos",
-        "line_pos",
-        "gear",
-        "field_size",
-        "line_count",
-    ]
 
-    for column in numeric_columns:
-        if column in merged.columns:
-            merged[column] = safe_to_numeric(merged[column])
-        else:
-            merged[column] = None
-
-    merged["source"] = merged.get("source", "chariloto")
-
-    for column in TRAINING_COLUMNS:
-        if column not in merged.columns:
-            merged[column] = None
-
-    ordered = merged[TRAINING_COLUMNS]
-    save_csv(ordered, Path(out_path))
-    logger.info("Normalised training rows: %s", len(ordered))
-    return ordered
+__all__ = ["to_training_csv"]

@@ -1,174 +1,169 @@
-"""Model training and inference utilities."""
+"""Simple model interface for Chariloto race predictions."""
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
+import logging
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import StandardScaler
 
-from utils import get_logger
-
-try:  # pragma: no cover - optional dependency
-    import lightgbm as lgb
-except Exception:  # pragma: no cover - optional dependency
-    lgb = None
-
-
-NUMERIC_FEATURES = [
-    "age",
-    "score",
-    "backs",
-    "homes",
-    "starts",
-    "win_rate",
-    "quinella_rate",
-    "top3_rate",
-    "gear",
-    "lane_no",
-    "field_size",
-    "line_count",
-]
-
-CATEGORICAL_FEATURES = ["class", "stadium", "style", "grade", "track", "prefecture"]
-
-TARGET_COLUMN = "finish_pos"
-
-
-@dataclass
-class ModelArtifacts:
-    pipeline: Pipeline
-    feature_columns: List[str]
+LOGGER = logging.getLogger(__name__)
+MODEL_FILENAME = "model.joblib"
 
 
 class Model:
-    """Wrapper around the underlying scikit-learn pipeline."""
+    """Wrapper around a scikit-learn pipeline with graceful fallbacks."""
 
-    def __init__(self, artifacts: ModelArtifacts) -> None:
-        self.artifacts = artifacts
-        self.logger = get_logger(__name__)
+    def __init__(
+        self,
+        pipeline: Optional[Pipeline],
+        feature_columns: List[str],
+        fallback_key: str = "score",
+    ) -> None:
+        self._pipeline = pipeline
+        self.feature_columns = feature_columns
+        self.fallback_key = fallback_key
 
     # ------------------------------------------------------------------
-    # Training
+    # Factory methods
     # ------------------------------------------------------------------
     @classmethod
     def train_from_csv(cls, races_csv: str) -> "Model":
-        logger = get_logger(__name__)
         df = pd.read_csv(races_csv, encoding="utf-8-sig")
-        if TARGET_COLUMN not in df.columns:
-            raise ValueError("Training CSV must contain finish_pos column")
+        if df.empty:
+            LOGGER.warning("Training dataset is empty; using fallback model")
+            return cls(pipeline=None, feature_columns=[], fallback_key="score")
+
         df = df.copy()
+        df["finish_pos"] = pd.to_numeric(df.get("finish_pos"), errors="coerce")
+        df["score"] = pd.to_numeric(df.get("score"), errors="coerce")
+        df["win_rate"] = pd.to_numeric(df.get("win_rate"), errors="coerce")
+        df["lane_no"] = pd.to_numeric(df.get("lane_no"), errors="coerce")
 
-        df[TARGET_COLUMN] = pd.to_numeric(df[TARGET_COLUMN], errors="coerce")
-        df = df[df[TARGET_COLUMN].notna()]
-        df["target"] = (df[TARGET_COLUMN] == 1).astype(int)
+        df = df.dropna(subset=["finish_pos", "lane_no"])
+        if df.empty:
+            LOGGER.warning("No labelled data available; using fallback model")
+            return cls(pipeline=None, feature_columns=[], fallback_key="score")
 
-        feature_columns = list({*NUMERIC_FEATURES, *CATEGORICAL_FEATURES})
-        for column in feature_columns:
-            if column not in df.columns:
-                df[column] = np.nan
+        df["target"] = (df["finish_pos"] == 1).astype(int)
+        positives = df["target"].sum()
+        negatives = len(df) - positives
+        if positives == 0 or negatives == 0:
+            LOGGER.warning("Imbalanced labels (pos=%s, neg=%s); using fallback model", positives, negatives)
+            return cls(pipeline=None, feature_columns=[], fallback_key="score")
 
-        numeric_transformer = Pipeline(
-            steps=[("imputer", SimpleImputer(strategy="median"))]
+        feature_columns = ["lane_no", "score", "win_rate"]
+        available_features = [col for col in feature_columns if col in df.columns]
+        if not available_features:
+            LOGGER.warning("No usable features found; using fallback model")
+            return cls(pipeline=None, feature_columns=[], fallback_key="score")
+
+        df_features = df[available_features].fillna(0)
+
+        transformer = ColumnTransformer(
+            transformers=[("num", StandardScaler(), available_features)],
+            remainder="drop",
         )
-        categorical_transformer = Pipeline(
+        pipeline = Pipeline(
             steps=[
-                ("imputer", SimpleImputer(strategy="most_frequent")),
-                (
-                    "encoder",
-                    OneHotEncoder(handle_unknown="ignore", sparse=False),
-                ),
+                ("transform", transformer),
+                ("clf", LogisticRegression(max_iter=1000, class_weight="balanced")),
             ]
         )
-
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("num", numeric_transformer, NUMERIC_FEATURES),
-                ("cat", categorical_transformer, CATEGORICAL_FEATURES),
-            ]
-        )
-
-        classifier = (
-            lgb.LGBMClassifier(
-                n_estimators=300,
-                learning_rate=0.05,
-                max_depth=-1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="binary",
-            )
-            if lgb is not None
-            else RandomForestClassifier(n_estimators=400, random_state=42, n_jobs=-1)
-        )
-
-        pipeline = Pipeline(steps=[("preprocess", preprocessor), ("model", classifier)])
-        pipeline.fit(df[feature_columns], df["target"])
-
-        logger.info("Trained model on %s rows", len(df))
-        artifacts = ModelArtifacts(pipeline=pipeline, feature_columns=feature_columns)
-        return cls(artifacts)
+        pipeline.fit(df_features, df["target"])
+        LOGGER.info("Model trained with %s samples", len(df))
+        return cls(pipeline=pipeline, feature_columns=available_features, fallback_key="score")
 
     # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-    def save(self, out_dir: str | Path) -> None:
-        out_path = Path(out_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self.artifacts.pipeline, out_path / "model.joblib")
-        metadata = {
-            "feature_columns": self.artifacts.feature_columns,
-        }
-        (out_path / "metadata.json").write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        self.logger.info("Saved model to %s", out_path)
+    def save(self, out_dir: str) -> None:
+        path = Path(out_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        filepath = path / MODEL_FILENAME
+        joblib.dump({
+            "pipeline": self._pipeline,
+            "feature_columns": self.feature_columns,
+            "fallback_key": self.fallback_key,
+        }, filepath)
+        LOGGER.info("Model saved to %s", filepath)
 
+    # ------------------------------------------------------------------
     @classmethod
-    def load(cls, out_dir: str | Path) -> "Model":
-        out_path = Path(out_dir)
-        pipeline = joblib.load(out_path / "model.joblib")
-        metadata = json.loads((out_path / "metadata.json").read_text(encoding="utf-8"))
-        artifacts = ModelArtifacts(pipeline=pipeline, feature_columns=metadata["feature_columns"])
-        return cls(artifacts)
+    def load(cls, path_or_dir: str) -> "Model":
+        path = Path(path_or_dir)
+        if path.is_dir():
+            filepath = path / MODEL_FILENAME
+        else:
+            filepath = path
+        if not filepath.exists():
+            raise FileNotFoundError(f"Model file not found: {filepath}")
+        payload: Dict[str, object] = joblib.load(filepath)
+        pipeline = payload.get("pipeline")
+        feature_columns = payload.get("feature_columns", [])
+        fallback_key = payload.get("fallback_key", "score")
+        return cls(pipeline=pipeline, feature_columns=list(feature_columns), fallback_key=fallback_key)
 
-    # ------------------------------------------------------------------
-    # Inference
     # ------------------------------------------------------------------
     def predict_proba(self, cards_df: pd.DataFrame) -> np.ndarray:
+        if cards_df.empty:
+            return np.array([])
+        if self._pipeline is None or not self.feature_columns:
+            LOGGER.info("Using fallback probability based on %s", self.fallback_key)
+            return self._fallback_probability(cards_df)
+
+        features = self._prepare_features(cards_df)
+        try:
+            probabilities = self._pipeline.predict_proba(features)[:, 1]
+        except Exception as exc:  # pragma: no cover - safety net
+            LOGGER.error("Model prediction failed: %s", exc)
+            return self._fallback_probability(cards_df)
+        return probabilities
+
+    # ------------------------------------------------------------------
+    def _prepare_features(self, cards_df: pd.DataFrame) -> pd.DataFrame:
         df = cards_df.copy()
-        for column in self.artifacts.feature_columns:
+        for column in self.feature_columns:
             if column not in df.columns:
-                df[column] = np.nan
-        probs = self.artifacts.pipeline.predict_proba(df[self.artifacts.feature_columns])
-        if probs.ndim == 2:
-            positive = probs[:, -1]
-        else:
-            positive = probs
+                df[column] = 0
+        df = df[self.feature_columns]
+        for column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+        return df
 
-        # Softmax normalisation per race
-        race_ids = df.get("race_id")
-        if race_ids is None:
-            return positive
-
-        normalised = np.zeros_like(positive, dtype=float)
-        for race_id in pd.unique(race_ids):
-            mask = race_ids == race_id
-            group = positive[mask]
-            if group.size == 0:
-                continue
-            shifted = group - np.max(group)
-            exp = np.exp(shifted)
-            total = exp.sum()
-            if total == 0:
-                normalised[mask] = 1.0 / group.size
+    def _fallback_probability(self, cards_df: pd.DataFrame) -> np.ndarray:
+        df = cards_df.copy()
+        key = self.fallback_key
+        if key not in df.columns:
+            if "score" in df.columns:
+                key = "score"
+            elif "win_rate" in df.columns:
+                key = "win_rate"
             else:
-                normalised[mask] = exp / total
-        return normalised
+                key = None
+        if key:
+            values = pd.to_numeric(df.get(key), errors="coerce").fillna(0)
+        else:
+            values = pd.Series([1.0] * len(df))
+
+        df["_weight"] = values
+        if "race_id" not in df.columns:
+            df["race_id"] = ""
+
+        weights: List[float] = []
+        for _, group in df.groupby("race_id", dropna=False):
+            group_weights = group["_weight"].astype(float)
+            total = group_weights.sum()
+            if total <= 0:
+                normalized = np.full(len(group_weights), 1.0 / len(group_weights))
+            else:
+                normalized = group_weights / total
+            weights.extend(normalized.tolist())
+        return np.array(weights)
+
+
+__all__ = ["Model"]
