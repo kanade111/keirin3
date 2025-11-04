@@ -32,6 +32,65 @@ def _split_race_ids(text: Optional[str]) -> List[str]:
     return parts
 
 
+def _normalize_probabilities(entries: pd.DataFrame, probs: np.ndarray) -> np.ndarray:
+    if entries.empty:
+        return np.array([])
+    if probs.size != len(entries):
+        LOGGER.warning(
+            "Probability count mismatch (expected %s, got %s)",
+            len(entries),
+            probs.size,
+        )
+        return np.array([])
+    series = pd.Series(probs, index=entries.index, dtype=float)
+    normalized = np.zeros(len(entries), dtype=float)
+    race_ids = (
+        entries.get("race_id")
+        if "race_id" in entries.columns
+        else pd.Series(["" for _ in entries.index], index=entries.index)
+    )
+    if isinstance(race_ids, pd.Series):
+        race_ids = race_ids.fillna("")
+    grouped = race_ids.groupby(race_ids, sort=False) if isinstance(race_ids, pd.Series) else []
+    any_group = False
+    for _, idxs in grouped:
+        any_group = True
+        indices = idxs.index if isinstance(idxs, pd.Series) else idxs
+        weights = series.loc[indices].astype(float)
+        total = weights.sum()
+        if total <= 0:
+            values = np.full(len(indices), 1.0 / len(indices), dtype=float)
+        else:
+            values = (weights / total).to_numpy()
+        positions = entries.index.get_indexer(indices)
+        valid_mask = positions >= 0
+        if not np.all(valid_mask):
+            positions = positions[valid_mask]
+            values = values[valid_mask]
+        normalized[positions] = values
+    if not any_group or not np.isfinite(normalized).all() or normalized.sum() <= 0:
+        normalized = np.full(len(entries), 1.0 / len(entries), dtype=float)
+    return normalized
+
+
+def _prepare_cards(info_df: pd.DataFrame, entry_df: pd.DataFrame) -> pd.DataFrame:
+    cards = entry_df.copy()
+    if not info_df.empty and "race_id" in info_df.columns:
+        meta = info_df[["race_id", "race_name", "stadium"]].drop_duplicates()
+        cards = cards.merge(meta, on="race_id", how="left", suffixes=("", "_info"))
+        for column in ("race_name", "stadium"):
+            info_col = f"{column}_info"
+            if info_col in cards.columns:
+                cards[column] = cards[column].fillna(cards[info_col])
+        cards = cards.drop(columns=[col for col in cards.columns if col.endswith("_info")])
+
+    for column in ["race_id", "lane_no", "rider_name", "score", "stadium", "race_no", "date", "bank_code"]:
+        if column not in cards.columns:
+            cards[column] = "" if column not in {"score", "race_no"} else pd.NA
+    cards["lane_no"] = cards["lane_no"].astype(str)
+    return cards
+
+
 def _resolve_race_ids(
     date: str,
     race_ids_arg: Optional[str],
@@ -127,29 +186,37 @@ def _cmd_today(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cards_path = out_dir / "cards.csv"
-    entry_df.to_csv(cards_path, index=False, encoding="utf-8-sig")
+    cards_df = _prepare_cards(info_df, entry_df)
+    cards_df.to_csv(cards_path, index=False, encoding="utf-8-sig")
     LOGGER.info("Cards saved to %s", cards_path)
 
     predictions_path = out_dir / f"predictions_{date}.csv"
     try:
         model = Model.load(args.model)
-        probabilities = model.predict_proba(entry_df)
+        probabilities = model.predict_proba(cards_df)
         source = "model"
     except Exception as exc:  # pragma: no cover - fallback for runtime issues
         LOGGER.error("Model load/predict failed (%s); falling back to score-based probabilities", exc)
-        probabilities = _fallback_probabilities(entry_df)
+        probabilities = _fallback_probabilities(cards_df)
         source = "fallback"
 
     if probabilities.size == 0:
-        probabilities = _fallback_probabilities(entry_df)
+        probabilities = _fallback_probabilities(cards_df)
+        source = "fallback"
+
+    normalized = _normalize_probabilities(cards_df, probabilities)
+    if normalized.size == 0:
+        normalized = _fallback_probabilities(cards_df)
         source = "fallback"
 
     required_cols = ["race_id", "lane_no", "rider_name", "race_name", "stadium"]
     for column in required_cols:
-        if column not in entry_df.columns:
-            entry_df[column] = ""
-    predictions = entry_df[required_cols].copy()
-    predictions["win_proba"] = probabilities
+        if column not in cards_df.columns:
+            cards_df[column] = ""
+    predictions = cards_df[required_cols].copy()
+    predictions["date"] = cards_df.get("date", date)
+    predictions["bank_code"] = cards_df.get("bank_code", "")
+    predictions["win_proba"] = normalized
     predictions["prob_source"] = source
     predictions["expected_odds"] = predictions["win_proba"].apply(lambda p: float("inf") if p <= 0 else 1.0 / p)
 

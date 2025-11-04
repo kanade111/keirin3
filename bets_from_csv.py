@@ -70,6 +70,7 @@ def _prepare_pairs(df: pd.DataFrame, ev_threshold: float) -> pd.DataFrame:
                 "race_id": race_id,
                 "stadium": first.get("stadium", ""),
                 "race_name": first.get("race_name", ""),
+                "date": first.get("date", ""),
                 "bet_type": "2連単",
                 "first_lane": first["lane_no"],
                 "first_rider": first.get("rider_name", ""),
@@ -79,6 +80,7 @@ def _prepare_pairs(df: pd.DataFrame, ev_threshold: float) -> pd.DataFrame:
                 "second_win_proba": float(second["win_proba"]),
                 "pair_probability": pair_prob,
                 "expected_odds": expected_odds,
+                "combination": f"{first['lane_no']}-{second['lane_no']}",
             }
         )
     return pd.DataFrame(records)
@@ -118,6 +120,7 @@ def build_bets(
         "race_id",
         "stadium",
         "race_name",
+        "date",
         "bet_type",
         "first_lane",
         "first_rider",
@@ -127,6 +130,7 @@ def build_bets(
         "second_win_proba",
         "pair_probability",
         "expected_odds",
+        "combination",
         "stake",
     ]
     return pairs[columns] if not pairs.empty else pd.DataFrame(columns=columns)
