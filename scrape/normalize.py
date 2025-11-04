@@ -63,15 +63,52 @@ ALL_COLUMNS = [
 
 
 def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    numeric_like = {
+        "score",
+        "age",
+        "win_rate",
+        "quinella_rate",
+        "top3_rate",
+        "backs",
+        "homes",
+        "starts",
+        "kimarite_nige",
+        "kimarite_makuri",
+        "kimarite_sashi",
+        "kimarite_mark",
+        "finish_pos",
+        "line_pos",
+        "gear",
+        "field_size",
+        "line_count",
+    }
     for column in columns:
         if column not in df.columns:
-            df[column] = "" if column not in {"score", "age", "win_rate"} else pd.NA
+            df[column] = pd.NA if column in numeric_like else ""
     return df
 
 
 def _normalize_types(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    numeric_columns = ["score", "age", "win_rate", "finish_pos", "line_pos", "field_size"]
+    numeric_columns = [
+        "score",
+        "age",
+        "win_rate",
+        "quinella_rate",
+        "top3_rate",
+        "backs",
+        "homes",
+        "starts",
+        "kimarite_nige",
+        "kimarite_makuri",
+        "kimarite_sashi",
+        "kimarite_mark",
+        "finish_pos",
+        "line_pos",
+        "gear",
+        "field_size",
+        "line_count",
+    ]
     for column in numeric_columns:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
