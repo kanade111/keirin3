@@ -151,6 +151,20 @@ def _build_race_id(date: str, bank: str, race_no: Optional[int]) -> str:
     return f"{date_raw}CL{bank}{int(race_no):02d}"
 
 
+def _normalize_date_hint(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = _normalize_text(value)
+    if not text:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 8:
+        return _to_date_str(digits[:8])
+    return text
+
+
 def _create_session(timeout: float) -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -518,14 +532,26 @@ def _extract_info_records(
     return pd.DataFrame(records)
 
 
+def _empty_frames() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    info = pd.DataFrame(columns=INFO_COLUMNS)
+    entry = pd.DataFrame(columns=ENTRY_COLUMNS)
+    payout = pd.DataFrame(columns=PAYOUT_COLUMNS)
+    return info, entry, payout
+
+
 def fetch_results_for_ids(
-    race_ids: Iterable[str],
+    race_ids: Optional[Iterable[str]] = None,
+    date_hint: Optional[str] = None,
     timeout: float = 10.0,
     retries: int = 3,
     rate_limit: float = 0.6,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Charilotoの結果ページから情報を取得し正規化する。"""
 
+    provided_ids = [rid for rid in (race_ids or []) if rid]
+
+    key_to_race_ids: Dict[MeetingKey, List[Tuple[str, Optional[int]]]] = {}
+    for rid in provided_ids:
     race_ids = [rid for rid in race_ids if rid]
     if not race_ids:
         LOG.warning("No race IDs provided")
@@ -541,6 +567,21 @@ def fetch_results_for_ids(
         key, race_no = parsed
         key_to_race_ids.setdefault(key, []).append((rid, race_no))
 
+    keys_to_fetch: Dict[MeetingKey, List[Tuple[str, Optional[int]]]] = dict(key_to_race_ids)
+
+    if not keys_to_fetch:
+        normalized_hint = _normalize_date_hint(date_hint)
+        if not normalized_hint:
+            LOG.warning("No race IDs or valid date hint provided; returning empty frames")
+            return _empty_frames()
+        LOG.info(
+            "No valid race IDs supplied; enumerating banks 01-99 for %s",
+            normalized_hint,
+        )
+        for bank in range(1, 100):
+            key = MeetingKey(date=normalized_hint, bank_code=f"{bank:02d}")
+            keys_to_fetch.setdefault(key, [])
+
     session = _create_session(timeout)
 
     info_frames: List[pd.DataFrame] = []
@@ -548,6 +589,7 @@ def fetch_results_for_ids(
     payout_frames: List[pd.DataFrame] = []
 
     for key, key_race_ids in sorted(
+        keys_to_fetch.items(), key=lambda item: (item[0].date, item[0].bank_code)
         key_to_race_ids.items(), key=lambda item: (item[0].date, item[0].bank_code)
     ):
         LOG.info("Fetching meeting %s %s", key.date, key.bank_code)
@@ -571,6 +613,12 @@ def fetch_results_for_ids(
         headings = _find_heading_texts(soup)
         metadata = _extract_meeting_metadata(soup)
         meeting_entry_tables: List[Tuple[pd.DataFrame, Optional[int]]] = []
+        race_numbers = [
+            race_no
+            for _, race_no in sorted(key_race_ids, key=lambda item: (item[1] or 0))
+            if race_no is not None
+        ]
+        requested_ids = {rid for rid, _ in key_race_ids if rid}
         race_numbers = [race_no for _, race_no in sorted(key_race_ids, key=lambda item: (item[1] or 0))]
         requested_ids = {rid for rid, _ in key_race_ids}
 
@@ -584,6 +632,17 @@ def fetch_results_for_ids(
                 race_no_hint = race_numbers[entry_counter] if entry_counter < len(race_numbers) else None
                 default_race_no = race_no_hint or (entry_counter + 1)
                 normalized = _normalize_entry_table(table, heading, key, default_race_no)
+                filtered = (
+                    normalized
+                    if not requested_ids
+                    else normalized[
+                        normalized["race_id"].isin(requested_ids)
+                        | (normalized["race_id"] == "")
+                    ]
+                )
+                meeting_entry_tables.append((table, default_race_no))
+                if not filtered.empty:
+                    entry_frames.append(filtered)
                 normalized = normalized[normalized["race_id"].isin(requested_ids) | (normalized["race_id"] == "")]
                 if not normalized.empty:
                     meeting_entry_tables.append((table, default_race_no))
@@ -593,11 +652,22 @@ def fetch_results_for_ids(
                 race_no_hint = race_numbers[payout_counter] if payout_counter < len(race_numbers) else None
                 default_race_no = race_no_hint or (payout_counter + 1)
                 payout_df = _normalize_payout_table(table, heading, key, default_race_no)
+                if requested_ids:
+                    payout_df = payout_df[
+                        payout_df["race_id"].isin(requested_ids)
+                        | (payout_df["race_id"] == "")
+                    ]
+                if not payout_df.empty:
+                    payout_frames.append(payout_df)
                 payout_frames.append(payout_df[payout_df["race_id"].isin(requested_ids) | (payout_df["race_id"] == "")])
                 payout_counter += 1
 
         if meeting_entry_tables:
             info_df = _extract_info_records(key, headings, meeting_entry_tables, metadata)
+            if requested_ids:
+                info_df = info_df[info_df["race_id"].isin(requested_ids)]
+            if not info_df.empty or not requested_ids:
+                info_frames.append(info_df)
             info_frames.append(info_df[info_df["race_id"].isin(requested_ids)])
         else:
             LOG.warning("No entry tables extracted for %s", CHARILOTO_URL.format(bank=key.bank_code, date=key.date.replace("-", "")))

@@ -121,7 +121,8 @@ def _cmd_fetch(args: argparse.Namespace) -> None:
     date = args.date
     race_ids = _resolve_race_ids(date, args.race_ids, args.timeout, args.retries, args.rate_limit)
     info_df, entry_df, payout_df = fetch_results_for_ids(
-        race_ids,
+        race_ids=race_ids or None,
+        date_hint=date,
         timeout=args.timeout,
         retries=args.retries,
         rate_limit=args.rate_limit,
@@ -176,7 +177,8 @@ def _cmd_today(args: argparse.Namespace) -> None:
     date = args.date or dt.date.today().strftime("%Y-%m-%d")
     race_ids = _resolve_race_ids(date, args.race_ids, args.timeout, args.retries, args.rate_limit)
     info_df, entry_df, _ = fetch_results_for_ids(
-        race_ids,
+        race_ids=race_ids or None,
+        date_hint=date,
         timeout=args.timeout,
         retries=args.retries,
         rate_limit=args.rate_limit,
