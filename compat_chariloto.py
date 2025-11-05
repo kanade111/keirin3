@@ -552,6 +552,14 @@ def fetch_results_for_ids(
 
     key_to_race_ids: Dict[MeetingKey, List[Tuple[str, Optional[int]]]] = {}
     for rid in provided_ids:
+    race_ids = [rid for rid in race_ids if rid]
+    if not race_ids:
+        LOG.warning("No race IDs provided")
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    key_to_race_ids: Dict[MeetingKey, List[Tuple[str, Optional[int]]]] = {}
+    for rid in race_ids:
         parsed = _parse_race_id(rid)
         if not parsed:
             LOG.warning("Invalid race_id format: %s", rid)
@@ -582,6 +590,7 @@ def fetch_results_for_ids(
 
     for key, key_race_ids in sorted(
         keys_to_fetch.items(), key=lambda item: (item[0].date, item[0].bank_code)
+        key_to_race_ids.items(), key=lambda item: (item[0].date, item[0].bank_code)
     ):
         LOG.info("Fetching meeting %s %s", key.date, key.bank_code)
         html_text = _fetch_html(
@@ -610,6 +619,8 @@ def fetch_results_for_ids(
             if race_no is not None
         ]
         requested_ids = {rid for rid, _ in key_race_ids if rid}
+        race_numbers = [race_no for _, race_no in sorted(key_race_ids, key=lambda item: (item[1] or 0))]
+        requested_ids = {rid for rid, _ in key_race_ids}
 
         entry_counter = 0
         payout_counter = 0
@@ -632,6 +643,10 @@ def fetch_results_for_ids(
                 meeting_entry_tables.append((table, default_race_no))
                 if not filtered.empty:
                     entry_frames.append(filtered)
+                normalized = normalized[normalized["race_id"].isin(requested_ids) | (normalized["race_id"] == "")]
+                if not normalized.empty:
+                    meeting_entry_tables.append((table, default_race_no))
+                    entry_frames.append(normalized)
                 entry_counter += 1
             elif _classify_table(columns, PAYOUT_KEYWORDS):
                 race_no_hint = race_numbers[payout_counter] if payout_counter < len(race_numbers) else None
@@ -644,6 +659,7 @@ def fetch_results_for_ids(
                     ]
                 if not payout_df.empty:
                     payout_frames.append(payout_df)
+                payout_frames.append(payout_df[payout_df["race_id"].isin(requested_ids) | (payout_df["race_id"] == "")])
                 payout_counter += 1
 
         if meeting_entry_tables:
@@ -652,6 +668,7 @@ def fetch_results_for_ids(
                 info_df = info_df[info_df["race_id"].isin(requested_ids)]
             if not info_df.empty or not requested_ids:
                 info_frames.append(info_df)
+            info_frames.append(info_df[info_df["race_id"].isin(requested_ids)])
         else:
             LOG.warning("No entry tables extracted for %s", CHARILOTO_URL.format(bank=key.bank_code, date=key.date.replace("-", "")))
 
